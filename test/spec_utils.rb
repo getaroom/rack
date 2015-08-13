@@ -1,8 +1,18 @@
 # -*- encoding: utf-8 -*-
 require 'rack/utils'
 require 'rack/mock'
+require 'timeout'
 
 describe Rack::Utils do
+
+  # A helper method which checks
+  # if certain query parameters 
+  # are equal.
+  def equal_query_to(query)
+    parts = query.split('&')
+    lambda{|other| (parts & other.split('&')) == parts }
+  end
+
   def kcodeu
     one8 = RUBY_VERSION.to_f < 1.9
     default_kcode, $KCODE = $KCODE, 'U' if one8
@@ -103,6 +113,14 @@ describe Rack::Utils do
     Rack::Utils.parse_query("my+weird+field=q1%212%22%27w%245%267%2Fz8%29%3F").
       should.equal "my weird field" => "q1!2\"'w$5&7/z8)?"
     Rack::Utils.parse_query("foo%3Dbaz=bar").should.equal "foo=baz" => "bar"
+    Rack::Utils.parse_query("=").should.equal "" => ""
+    Rack::Utils.parse_query("=value").should.equal "" => "value"
+    Rack::Utils.parse_query("key=").should.equal "key" => ""
+    Rack::Utils.parse_query("&key&").should.equal "key" => nil
+    Rack::Utils.parse_query(";key;", ";,").should.equal "key" => nil
+    Rack::Utils.parse_query(",key,", ";,").should.equal "key" => nil
+    Rack::Utils.parse_query(";foo=bar,;", ";,").should.equal "foo" => "bar"
+    Rack::Utils.parse_query(",foo=bar;,", ";,").should.equal "foo" => "bar"
   end
 
   should "parse nested query strings correctly" do
@@ -179,7 +197,7 @@ describe Rack::Utils do
 
     lambda { Rack::Utils.parse_nested_query("x[y]=1&x[]=1") }.
       should.raise(TypeError).
-      message.should.equal "expected Array (got Hash) for param `x'"
+      message.should.match(/expected Array \(got [^)]*\) for param `x'/)
 
     lambda { Rack::Utils.parse_nested_query("x[y]=1&x[y][][w]=2") }.
       should.raise(TypeError).
@@ -187,13 +205,13 @@ describe Rack::Utils do
   end
 
   should "build query strings correctly" do
-    Rack::Utils.build_query("foo" => "bar").should.equal "foo=bar"
+    Rack::Utils.build_query("foo" => "bar").should.be equal_query_to("foo=bar")
     Rack::Utils.build_query("foo" => ["bar", "quux"]).
-      should.equal "foo=bar&foo=quux"
+      should.be equal_query_to("foo=bar&foo=quux")
     Rack::Utils.build_query("foo" => "1", "bar" => "2").
-      should.equal "foo=1&bar=2"
+      should.be equal_query_to("foo=1&bar=2")
     Rack::Utils.build_query("my weird field" => "q1!2\"'w$5&7/z8)?").
-      should.equal "my+weird+field=q1%212%22%27w%245%267%2Fz8%29%3F"
+      should.be equal_query_to("my+weird+field=q1%212%22%27w%245%267%2Fz8%29%3F")
   end
 
   should "build nested query strings correctly" do
@@ -202,9 +220,9 @@ describe Rack::Utils do
     Rack::Utils.build_nested_query("foo" => "bar").should.equal "foo=bar"
 
     Rack::Utils.build_nested_query("foo" => "1", "bar" => "2").
-      should.equal "foo=1&bar=2"
+      should.be equal_query_to("foo=1&bar=2")
     Rack::Utils.build_nested_query("my weird field" => "q1!2\"'w$5&7/z8)?").
-      should.equal "my+weird+field=q1%212%22%27w%245%267%2Fz8%29%3F"
+      should.be equal_query_to("my+weird+field=q1%212%22%27w%245%267%2Fz8%29%3F")
 
     Rack::Utils.build_nested_query("foo" => [nil]).
       should.equal "foo[]"
@@ -313,6 +331,11 @@ describe Rack::Utils do
     Rack::Utils.bytesize("FOO\xE2\x82\xAC").should.equal 6
   end
 
+  should "should perform constant time string comparison" do
+    Rack::Utils.secure_compare('a', 'a').should.equal true
+    Rack::Utils.secure_compare('a', 'b').should.equal false
+  end
+
   should "return status code for integer" do
     Rack::Utils.status_code(200).should.equal 200
   end
@@ -345,6 +368,10 @@ describe Rack::Utils, "byte_range" do
     Rack::Utils.byte_ranges({"HTTP_RANGE" => "bytes=-100"},500).should.equal [(400..499)]
     Rack::Utils.byte_ranges({"HTTP_RANGE" => "bytes=0-0"},500).should.equal [(0..0)]
     Rack::Utils.byte_ranges({"HTTP_RANGE" => "bytes=499-499"},500).should.equal [(499..499)]
+  end
+
+  should "parse several byte ranges" do
+    Rack::Utils.byte_ranges({"HTTP_RANGE" => "bytes=500-600,601-999"},1000).should.equal [(500..600),(601..999)]
   end
 
   should "truncate byte ranges" do

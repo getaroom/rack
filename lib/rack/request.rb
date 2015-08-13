@@ -72,6 +72,8 @@ module Rack
         'https'
       elsif @env['HTTP_X_FORWARDED_SSL'] == 'on'
         'https'
+      elsif @env['HTTP_X_FORWARDED_SCHEME']
+        @env['HTTP_X_FORWARDED_SCHEME']
       elsif @env['HTTP_X_FORWARDED_PROTO']
         @env['HTTP_X_FORWARDED_PROTO'].split(',')[0]
       else
@@ -175,7 +177,7 @@ module Rack
       PARSEABLE_DATA_MEDIA_TYPES.include?(media_type)
     end
 
-    # Returns the data recieved in the query string.
+    # Returns the data received in the query string.
     def GET
       if @env["rack.request.query_string"] == query_string
         @env["rack.request.query_hash"]
@@ -185,7 +187,7 @@ module Rack
       end
     end
 
-    # Returns the data recieved in the request body.
+    # Returns the data received in the request body.
     #
     # This method support both application/x-www-form-urlencoded and
     # multipart/form-data.
@@ -258,11 +260,10 @@ module Rack
       #   the Cookie header such that those with more specific Path attributes
       #   precede those with less specific.  Ordering with respect to other
       #   attributes (e.g., Domain) is unspecified.
-      Utils.parse_query(string, ';,').each { |k,v| hash[k] = Array === v ? v.first : v }
+      cookies = Utils.parse_query(string, ';,') { |s| Rack::Utils.unescape(s) rescue s }
+      cookies.each { |k,v| hash[k] = Array === v ? v.first : v }
       @env["rack.request.cookie_string"] = string
       hash
-    rescue => error
-      raise error.class, "cannot parse Cookie header: #{error.message}"
     end
 
     def xhr?

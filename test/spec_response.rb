@@ -1,4 +1,3 @@
-require 'set'
 require 'rack/response'
 require 'stringio'
 
@@ -125,7 +124,6 @@ describe Rack::Response do
     response = Rack::Response.new
     response.redirect "/foo"
     status, header, body = response.finish
-
     status.should.equal 302
     header["Location"].should.equal "/foo"
 
@@ -147,7 +145,12 @@ describe Rack::Response do
     str = ""; body.each { |part| str << part }
     str.should.equal "foobar"
 
-    r = Rack::Response.new(["foo", "bar"].to_set)
+    object_with_each = Object.new
+    def object_with_each.each
+      yield "foo"
+      yield "bar"
+    end
+    r = Rack::Response.new(object_with_each)
     r.write "foo"
     status, header, body = r.finish
     str = ""; body.each { |part| str << part }
@@ -218,6 +221,11 @@ describe Rack::Response do
     res.should.be.client_error
     res.should.be.not_found
 
+    res.status = 405
+    res.should.not.be.successful
+    res.should.be.client_error
+    res.should.be.method_not_allowed
+
     res.status = 422
     res.should.not.be.successful
     res.should.be.client_error
@@ -271,5 +279,35 @@ describe Rack::Response do
     res.body = StringIO.new
     res.close
     res.body.should.be.closed
+  end
+
+  it "calls close on #body when 204, 205, or 304" do
+    res = Rack::Response.new
+    res.body = StringIO.new
+    res.finish
+    res.body.should.not.be.closed
+
+    res.status = 204
+    _, _, b = res.finish
+    res.body.should.be.closed
+    b.should.not == res.body
+
+    res.body = StringIO.new
+    res.status = 205
+    _, _, b = res.finish
+    res.body.should.be.closed
+    b.should.not == res.body
+
+    res.body = StringIO.new
+    res.status = 304
+    _, _, b = res.finish
+    res.body.should.be.closed
+    b.should.not == res.body
+  end
+
+  it "wraps the body from #to_ary to prevent infinite loops" do
+    res = Rack::Response.new
+    res.finish.last.should.not.respond_to?(:to_ary)
+    lambda { res.finish.last.to_ary }.should.raise(NoMethodError)
   end
 end

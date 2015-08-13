@@ -8,8 +8,10 @@ major, minor, patch = RUBY_VERSION.split('.').map { |v| v.to_i }
 
 if major == 1 && minor < 9
   require 'rack/backports/uri/common_18'
-elsif major == 1 && minor == 9 && patch < 3
+elsif major == 1 && minor == 9 && patch == 2 && RUBY_PATCHLEVEL <= 320 && RUBY_ENGINE != 'jruby'
   require 'rack/backports/uri/common_192'
+elsif major == 1 && minor == 9 && patch == 3 && RUBY_PATCHLEVEL < 125
+  require 'rack/backports/uri/common_193'
 else
   require 'uri/common'
 end
@@ -47,16 +49,29 @@ module Rack
 
     DEFAULT_SEP = /[&;] */n
 
+    class << self
+      attr_accessor :key_space_limit
+    end
+
+    # The default number of bytes to allow parameter keys to take up.
+    # This helps prevent a rogue client from flooding a Request.
+    self.key_space_limit = 65536
+
     # Stolen from Mongrel, with some small modifications:
     # Parses a query string by breaking it up at the '&'
     # and ';' characters.  You can also use this to parse
     # cookies by changing the characters used in the second
     # parameter (which defaults to '&;').
-    def parse_query(qs, d = nil)
-      params = {}
+    def parse_query(qs, d = nil, &unescaper)
+      unescaper ||= method(:unescape)
+
+      params = KeySpaceConstrainedParams.new
 
       (qs || '').split(d ? /[#{d}] */n : DEFAULT_SEP).each do |p|
-        k, v = p.split('=', 2).map { |x| unescape(x) }
+        next if p.empty?
+        k, v = p.split('=', 2).map(&unescaper)
+        next unless k || v
+
         if cur = params[k]
           if cur.class == Array
             params[k] << v
@@ -68,19 +83,20 @@ module Rack
         end
       end
 
-      return params
+      return params.to_params_hash
     end
     module_function :parse_query
 
     def parse_nested_query(qs, d = nil)
-      params = {}
+      params = KeySpaceConstrainedParams.new
 
       (qs || '').split(d ? /[#{d}] */n : DEFAULT_SEP).each do |p|
         k, v = p.split('=', 2).map { |s| unescape(s) }
+
         normalize_params(params, k, v)
       end
 
-      return params
+      return params.to_params_hash
     end
     module_function :parse_nested_query
 
@@ -101,20 +117,25 @@ module Rack
         child_key = $1
         params[k] ||= []
         raise TypeError, "expected Array (got #{params[k].class.name}) for param `#{k}'" unless params[k].is_a?(Array)
-        if params[k].last.is_a?(Hash) && !params[k].last.key?(child_key)
+        if params_hash_type?(params[k].last) && !params[k].last.key?(child_key)
           normalize_params(params[k].last, child_key, v)
         else
-          params[k] << normalize_params({}, child_key, v)
+          params[k] << normalize_params(params.class.new, child_key, v)
         end
       else
-        params[k] ||= {}
-        raise TypeError, "expected Hash (got #{params[k].class.name}) for param `#{k}'" unless params[k].is_a?(Hash)
+        params[k] ||= params.class.new
+        raise TypeError, "expected Hash (got #{params[k].class.name}) for param `#{k}'" unless params_hash_type?(params[k])
         params[k] = normalize_params(params[k], after, v)
       end
 
       return params
     end
     module_function :normalize_params
+
+    def params_hash_type?(obj)
+      obj.kind_of?(KeySpaceConstrainedParams) || obj.kind_of?(Hash)
+    end
+    module_function :params_hash_type?
 
     def build_query(params)
       params.map { |k, v|
@@ -294,16 +315,16 @@ module Rack
     def byte_ranges(env, size)
       # See <http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.35>
       http_range = env['HTTP_RANGE']
-      return nil unless http_range
+      return nil unless http_range && http_range =~ /bytes=([^;]+)/
       ranges = []
-      http_range.split(/,\s*/).each do |range_spec|
-        matches = range_spec.match(/bytes=(\d*)-(\d*)/)
-        return nil  unless matches
-        r0,r1 = matches[1], matches[2]
+      $1.split(/,\s*/).each do |range_spec|
+        return nil  unless range_spec =~ /(\d*)-(\d*)/
+        r0,r1 = $1, $2
         if r0.empty?
           return nil  if r1.empty?
           # suffix-byte-range-spec, represents trailing suffix of file
-          r0 = [size - r1.to_i, 0].max
+          r0 = size - r1.to_i
+          r0 = 0  if r0 < 0
           r1 = size - 1
         else
           r0 = r0.to_i
@@ -320,6 +341,18 @@ module Rack
       ranges
     end
     module_function :byte_ranges
+
+    # Constant time string comparison.
+    def secure_compare(a, b)
+      return false unless bytesize(a) == bytesize(b)
+
+      l = a.unpack("C*")
+
+      r, i = 0, -1
+      b.each_byte { |v| r |= v ^ l[i+=1] }
+      r == 0
+    end
+    module_function :secure_compare
 
     # Context allows the use of a compatible middleware at different points
     # in a request handling stack. A compatible middleware must define
@@ -415,6 +448,41 @@ module Rack
       end
     end
 
+    class KeySpaceConstrainedParams
+      def initialize(limit = Utils.key_space_limit)
+        @limit  = limit
+        @size   = 0
+        @params = {}
+      end
+
+      def [](key)
+        @params[key]
+      end
+
+      def []=(key, value)
+        @size += key.size if key && !@params.key?(key)
+        raise RangeError, 'exceeded available parameter key space' if @size > @limit
+        @params[key] = value
+      end
+
+      def key?(key)
+        @params.key?(key)
+      end
+
+      def to_params_hash
+        hash = @params
+        hash.keys.each do |key|
+          value = hash[key]
+          if value.kind_of?(self.class)
+            hash[key] = value.to_params_hash
+          elsif value.kind_of?(Array)
+            value.map! {|x| x.kind_of?(self.class) ? x.to_params_hash : x}
+          end
+        end
+        hash
+      end
+    end
+
     # Every standard HTTP code mapped to the appropriate message.
     # Generated with:
     #   curl -s http://www.iana.org/assignments/http-status-codes | \
@@ -459,6 +527,7 @@ module Rack
       415  => 'Unsupported Media Type',
       416  => 'Requested Range Not Satisfiable',
       417  => 'Expectation Failed',
+      418  => "I'm a Teapot",
       422  => 'Unprocessable Entity',
       423  => 'Locked',
       424  => 'Failed Dependency',

@@ -1,4 +1,5 @@
 require 'rack/session/cookie'
+require 'rack/lint'
 require 'rack/mock'
 
 describe Rack::Session::Cookie do
@@ -9,9 +10,9 @@ describe Rack::Session::Cookie do
     hash.delete("session_id")
     Rack::Response.new(hash.inspect).to_a
   end
-
+  
   session_id = lambda do |env|
-    Rack::Response.new(env["rack.session"].inspect).to_a
+    Rack::Response.new(env["rack.session"].to_hash.inspect).to_a
   end
 
   session_option = lambda do |opt|
@@ -22,6 +23,50 @@ describe Rack::Session::Cookie do
 
   nothing = lambda do |env|
     Rack::Response.new("Nothing").to_a
+  end
+
+  renewer = lambda do |env|
+    env["rack.session.options"][:renew] = true
+    Rack::Response.new("Nothing").to_a
+  end
+
+  only_session_id = lambda do |env|
+    Rack::Response.new(env["rack.session"]["session_id"].to_s).to_a
+  end
+
+  bigcookie = lambda do |env|
+    env["rack.session"]["cookie"] = "big" * 3000
+    Rack::Response.new(env["rack.session"].inspect).to_a
+  end
+
+  destroy_session = lambda do |env|
+    env["rack.session"].destroy
+    Rack::Response.new("Nothing").to_a
+  end
+
+  def response_for(options={})
+    request_options = options.fetch(:request, {})
+    cookie = if options[:cookie].is_a?(Rack::Response)
+      options[:cookie]["Set-Cookie"]
+    else
+      options[:cookie]
+    end
+    request_options["HTTP_COOKIE"] = cookie || ""
+
+    app_with_cookie = Rack::Session::Cookie.new(*options[:app])
+    app_with_cookie = Rack::Lint.new(app_with_cookie)
+    Rack::MockRequest.new(app_with_cookie).get("/", request_options)
+  end
+
+  before do
+    @warnings = warnings = []
+    Rack::Session::Cookie.class_eval do
+      define_method(:warn) { |m| warnings << m }
+    end
+  end
+
+  after do
+    Rack::Session::Cookie.class_eval { remove_method :warn }
   end
 
   describe 'Base64' do
@@ -55,6 +100,14 @@ describe Rack::Session::Cookie do
         coder.decode('lulz').should.equal nil
       end
     end
+  end
+
+  it "warns if no secret is given" do
+    cookie = Rack::Session::Cookie.new(incrementor)
+    @warnings.first.should =~ /no secret/i
+    @warnings.clear
+    cookie = Rack::Session::Cookie.new(incrementor, :secret => 'abc')
+    @warnings.should.be.empty?
   end
 
   it 'uses a coder' do
@@ -106,17 +159,26 @@ describe Rack::Session::Cookie do
     res = Rack::MockRequest.new(Rack::Session::Cookie.new(incrementor)).get("/")
     res = Rack::MockRequest.new(Rack::Session::Cookie.new(only_session_id)).
       get("/", "HTTP_COOKIE" => res["Set-Cookie"])
+
+    res.body.should.not.equal ""
     old_session_id = res.body
+
     res = Rack::MockRequest.new(Rack::Session::Cookie.new(renewer)).
       get("/", "HTTP_COOKIE" => res["Set-Cookie"])
     res = Rack::MockRequest.new(Rack::Session::Cookie.new(only_session_id)).
       get("/", "HTTP_COOKIE" => res["Set-Cookie"])
+
+    res.body.should.not.equal ""
     res.body.should.not.equal old_session_id
   end
 
   it "survives broken cookies" do
     res = Rack::MockRequest.new(Rack::Session::Cookie.new(incrementor)).
       get("/", "HTTP_COOKIE" => "rack.session=blarghfasel")
+    res.body.should.equal '{"counter"=>1}'
+
+    app = Rack::Session::Cookie.new(incrementor, :secret => 'test')
+    res = Rack::MockRequest.new(app).get("/", "HTTP_COOKIE" => "rack.session=")
     res.body.should.equal '{"counter"=>1}'
   end
 
@@ -132,7 +194,7 @@ describe Rack::Session::Cookie do
     }.should.raise(Rack::MockRequest::FatalWarning)
   end
 
-  it "loads from a cookie wih integrity hash" do
+  it "loads from a cookie with integrity hash" do
     res = Rack::MockRequest.new(Rack::Session::Cookie.new(incrementor, :secret => 'test')).get("/")
     cookie = res["Set-Cookie"]
     res = Rack::MockRequest.new(Rack::Session::Cookie.new(incrementor, :secret => 'test')).
@@ -142,6 +204,9 @@ describe Rack::Session::Cookie do
     res = Rack::MockRequest.new(Rack::Session::Cookie.new(incrementor, :secret => 'test')).
       get("/", "HTTP_COOKIE" => cookie)
     res.body.should.equal '{"counter"=>3}'
+    res = Rack::MockRequest.new(Rack::Session::Cookie.new(incrementor, :secret => 'other')).
+      get("/", "HTTP_COOKIE" => cookie)
+    res.body.should.equal '{"counter"=>1}'
   end
 
   it "loads from a cookie wih accept-only integrity hash for graceful key rotation" do
@@ -160,14 +225,61 @@ describe Rack::Session::Cookie do
     app = Rack::Session::Cookie.new(incrementor, :secret => 'test')
     response1 = Rack::MockRequest.new(app).get("/")
     response1.body.should.equal '{"counter"=>1}'
+    response1 = Rack::MockRequest.new(app).get("/", "HTTP_COOKIE" => response1["Set-Cookie"])
+    response1.body.should.equal '{"counter"=>2}'
 
     _, digest = response1["Set-Cookie"].split("--")
     tampered_with_cookie = "hackerman-was-here" + "--" + digest
     response2 = Rack::MockRequest.new(app).get("/", "HTTP_COOKIE" =>
                                                tampered_with_cookie)
 
-    # Tampared cookie was ignored. Counter is back to 1.
+    # Tampered cookie was ignored. Counter is back to 1.
     response2.body.should.equal '{"counter"=>1}'
+  end
+
+  it "supports either of secret or old_secret" do
+    app = Rack::Session::Cookie.new(incrementor, :secret => 'test')
+    res = Rack::MockRequest.new(app).get("/")
+    res.body.should.equal '{"counter"=>1}'
+    res = Rack::MockRequest.new(app).get("/", "HTTP_COOKIE" => res["Set-Cookie"])
+    res.body.should.equal '{"counter"=>2}'
+    app = Rack::Session::Cookie.new(incrementor, :old_secret => 'test')
+    res = Rack::MockRequest.new(app).get("/")
+    res.body.should.equal '{"counter"=>1}'
+    res = Rack::MockRequest.new(app).get("/", "HTTP_COOKIE" => res["Set-Cookie"])
+    res.body.should.equal '{"counter"=>2}'
+  end
+
+  describe "1.9 bugs relating to inspecting yet-to-be-loaded from cookie data: Rack::Session::Abstract::SessionHash" do
+
+    it "can handle Rack::Lint middleware" do
+      app = Rack::Session::Cookie.new(incrementor)
+      res = Rack::MockRequest.new(app).get("/")
+
+      app = Rack::Session::Cookie.new(Rack::Lint.new(session_id))
+      res = Rack::MockRequest.new(app).get("/", "HTTP_COOKIE" => res["Set-Cookie"])
+      res.body.should.not.be.nil
+    end
+
+    it "can handle a middleware that inspects the env" do
+      class TestEnvInspector
+        def initialize(app)
+          @app = app
+        end
+        def call(env)
+          env.inspect
+          @app.call(env)
+        end
+      end
+
+      app = Rack::Session::Cookie.new(incrementor)
+      res = Rack::MockRequest.new(app).get("/")
+
+      app = Rack::Session::Cookie.new(TestEnvInspector.new(session_id))
+      res = Rack::MockRequest.new(app).get("/", "HTTP_COOKIE" => res["Set-Cookie"])
+      res.body.should.not.be.nil
+    end
+
   end
 
   it "returns the session id in the session hash" do
@@ -188,6 +300,7 @@ describe Rack::Session::Cookie do
 
     res = Rack::MockRequest.new(app).get("/", "HTTPS" => "on")
     res["Set-Cookie"].should.not.be.nil
+    res["Set-Cookie"].should.match(/secure/)
   end
 
   it "does not return a cookie if cookie was not read/written" do
@@ -230,5 +343,19 @@ describe Rack::Session::Cookie do
     app = Rack::Session::Cookie.new(session_id)
     res = Rack::MockRequest.new(app).get("/", 'rack.session' => {:foo => 'bar'})
     res.body.should.match(/foo/)
+  end
+
+  it "allows modifying session data with session data from middleware in front" do
+    request = { 'rack.session' => { :foo => 'bar' }}
+    response = response_for(:app => incrementor, :request => request)
+    response.body.should.match(/counter/)
+    response.body.should.match(/foo/)
+  end
+
+  it "allows modifying session data with session data from middleware in front" do
+    request = { 'rack.session' => { :foo => 'bar' }}
+    response = response_for(:app => incrementor, :request => request)
+    response.body.should.match(/counter/)
+    response.body.should.match(/foo/)
   end
 end
